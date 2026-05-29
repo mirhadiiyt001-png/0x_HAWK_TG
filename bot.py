@@ -1276,6 +1276,7 @@ def main() -> None:
 
     # Register bot commands with Telegram
     async def post_init(application) -> None:
+        await application.bot.delete_webhook(drop_pending_updates=True)
         await application.bot.set_my_commands([
             ("start", "Welcome & activate access"),
             ("stats", "Live SMS & OTP statistics"),
