@@ -340,6 +340,7 @@ def format_stats_message(total: int, displayed: int, otps: int, session_sms: int
     now = datetime.now()
     monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     week_label = f"Mon {monday.strftime('%d %b')} → Now"
+    updated_at = now.strftime("%H:%M:%S")
     return (
         f'{ce("🏆")} <b>LIVE STATISTICS</b> {ce("🏆")}\n'
         f'{LINE_SEPARATOR}\n\n'
@@ -350,8 +351,9 @@ def format_stats_message(total: int, displayed: int, otps: int, session_sms: int
         f'├ {ce("📅")} OTPs this week   →  <b>{week_otps}</b>  <i>({week_label})</i>\n'
         f'╰ {ce("✨")} New this session →  <b>{session_sms}</b>\n\n'
         f'╭─ {ce("💎")} <b>SYSTEM</b>\n'
-        f'├ {ce("🟢")} Status   →  <b>ACTIVE</b>\n'
-        f'╰ {ce("🔄")} Refresh  →  <b>Every 5 seconds</b>\n'
+        f'├ {ce("🟢")} Status      →  <b>ACTIVE</b>\n'
+        f'├ {ce("🔄")} Auto-refresh →  <b>Every 5 seconds</b>\n'
+        f'╰ {ce("🕐")} Updated     →  <b>{updated_at}</b>\n'
         f'{LINE_SEPARATOR}'
     )
 
@@ -738,36 +740,121 @@ def count_otps_since_monday() -> int:
     return sum(1 for t in otp_timestamps if t >= cutoff)
 
 
+def count_otps_from_records(records: list[dict]) -> int:
+    """Count OTPs in API records from Monday 00:00 (local time) until now — real data, not session."""
+    now = datetime.now()
+    monday = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    count = 0
+    for rec in records:
+        ts_str = rec.get("date", "")
+        try:
+            ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+            if ts >= monday:
+                body = rec.get("message", "") or ""
+                if is_otp_message(body):
+                    count += 1
+        except Exception:
+            pass
+    return count
+
+
+# ── Active stats messages store (for auto-refresh) ──────────────────────────
+active_stats_messages: dict[str, dict] = {}  # key="{chat_id}:{msg_id}" → info
+
+
+def register_stats_message(chat_id: int | str, message_id: int, ttl: int = 300) -> None:
+    """Register a stats message for auto-refresh (expires after ttl seconds)."""
+    key = f"{chat_id}:{message_id}"
+    active_stats_messages[key] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "expires": time.time() + ttl,
+    }
+
+
+def build_stats_rows() -> list[list[dict]]:
+    """Build premium colored Refresh button rows for stats."""
+    return [
+        [with_icon({"text": "🔄  Live Refresh", "callback_data": "refresh_stats", "style": "primary"}, "🔄")],
+    ]
+
+
+async def _refresh_active_stats(bot, data: dict) -> None:
+    """Auto-edit all open stats messages with fresh data from a new poll."""
+    if not active_stats_messages:
+        return
+
+    records = data.get("records", [])
+    api_total = data.get("total", 0)
+    api_displayed = len(records)
+    week_otps = count_otps_from_records(records)
+
+    stats_text = format_stats_message(api_total, api_displayed, otp_count, total_sms_today, week_otps)
+    rows = build_stats_rows()
+    kb_full = _colorize(rows)
+    kb_plain = _strip_icons(kb_full)
+
+    now = time.time()
+    expired = [k for k, v in active_stats_messages.items() if now > v["expires"]]
+    for k in expired:
+        active_stats_messages.pop(k, None)
+
+    for key, info in list(active_stats_messages.items()):
+        try:
+            payload = {
+                "chat_id": info["chat_id"],
+                "message_id": info["message_id"],
+                "text": stats_text,
+                "parse_mode": "HTML",
+            }
+            resp = await _tg_post(BOT_TOKEN, "editMessageText", {**payload, "reply_markup": kb_full})
+            if not resp.get("ok"):
+                resp = await _tg_post(BOT_TOKEN, "editMessageText", {**payload, "reply_markup": kb_plain})
+            if not resp.get("ok"):
+                desc = resp.get("description", "").lower()
+                if "not modified" not in desc:
+                    active_stats_messages.pop(key, None)
+        except Exception as err:
+            logger.warning(f"Auto-refresh stats {key}: {err}")
+            active_stats_messages.pop(key, None)
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
         return
 
+    records: list[dict] = []
     api_total = 0
-    api_displayed = 0
     api_error = False
 
     try:
         data = await fetch_sms_cached()
+        records = data.get("records", [])
         api_total = data.get("total", 0)
-        api_displayed = len(data.get("records", []))
     except Exception as err:
         logger.error(f"cmd_stats API fetch failed: {err}")
         api_error = True
 
-    text = format_stats_message(
-        api_total,
-        api_displayed,
-        otp_count,
-        total_sms_today,
-        count_otps_since_monday(),
-    )
+    week_otps = count_otps_from_records(records)
+    text = format_stats_message(api_total, len(records), otp_count, total_sms_today, week_otps)
     if api_error:
         text += f'\n\n{ce("⚠️")} <i>API offline — showing session data only</i>'
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_stats")],
-    ])
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    rows = build_stats_rows()
+    try:
+        resp = await raw_send(BOT_TOKEN, update.effective_chat.id, text, rows)
+        msg_id = resp.get("result", {}).get("message_id")
+        if msg_id:
+            register_stats_message(update.effective_chat.id, msg_id)
+    except Exception:
+        # Fallback to SDK with plain button
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Live Refresh", callback_data="refresh_stats")],
+        ])
+        sent = await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        register_stats_message(update.effective_chat.id, sent.message_id)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -992,34 +1079,45 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         elif data == "refresh_stats":
             await query.answer("⚡️ Refreshing...", show_alert=False)
-            api_total = 0
-            api_displayed = 0
-            api_err = False
+            records_r: list[dict] = []
+            api_total_r = 0
+            api_err_r = False
             try:
                 d = await fetch_sms_cached()
-                api_total = d.get("total", 0)
-                api_displayed = len(d.get("records", []))
+                records_r = d.get("records", [])
+                api_total_r = d.get("total", 0)
             except Exception as err:
                 logger.error(f"refresh_stats API fetch failed: {err}")
-                api_err = True
+                api_err_r = True
+
+            week_otps_r = count_otps_from_records(records_r)
             stats_text = format_stats_message(
-                api_total,
-                api_displayed,
-                otp_count,
-                total_sms_today,
-                count_otps_since_monday(),
+                api_total_r, len(records_r), otp_count, total_sms_today, week_otps_r,
             )
-            if api_err:
+            if api_err_r:
                 stats_text += f'\n\n{ce("⚠️")} <i>API offline — showing session data only</i>'
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_stats")],
-            ])
-            try:
-                await query.edit_message_text(
-                    stats_text, parse_mode=ParseMode.HTML, reply_markup=kb,
-                )
-            except Exception as err:
-                logger.error(f"refresh_stats edit failed: {err}")
+
+            rows_r = build_stats_rows()
+            kb_r = _colorize(rows_r)
+            kb_r_plain = _strip_icons(kb_r)
+
+            msg_id = query.message.message_id
+            chat_id = query.message.chat.id
+            register_stats_message(chat_id, msg_id)
+
+            payload_r = {
+                "chat_id": chat_id,
+                "message_id": msg_id,
+                "text": stats_text,
+                "parse_mode": "HTML",
+            }
+            resp_r = await _tg_post(BOT_TOKEN, "editMessageText", {**payload_r, "reply_markup": kb_r})
+            if not resp_r.get("ok"):
+                resp_r = await _tg_post(BOT_TOKEN, "editMessageText", {**payload_r, "reply_markup": kb_r_plain})
+            if not resp_r.get("ok"):
+                desc_r = resp_r.get("description", "").lower()
+                if "not modified" not in desc_r:
+                    logger.error(f"refresh_stats edit failed: {resp_r.get('description')}")
 
     except Exception as err:
         logger.error(f"Callback query error: {err}")
@@ -1044,6 +1142,9 @@ async def poll_sms(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         data = await fetch_sms_cached()
         records = data.get("records", [])
+
+        # Auto-refresh any open stats messages on every poll
+        asyncio.create_task(_refresh_active_stats(context.bot, data))
 
         if is_first_run:
             for rec in records:
