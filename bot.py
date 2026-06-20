@@ -9,7 +9,7 @@ import html
 import re
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from telegram import (
@@ -336,7 +336,10 @@ def format_sms_message(sms: dict) -> str:
     )
 
 
-def format_stats_message(total: int, displayed: int, otps: int, session_sms: int) -> str:
+def format_stats_message(total: int, displayed: int, otps: int, session_sms: int, week_otps: int = 0) -> str:
+    now = datetime.now()
+    monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    week_label = f"Mon {monday.strftime('%d %b')} → Now"
     return (
         f'{ce("🏆")} <b>LIVE STATISTICS</b> {ce("🏆")}\n'
         f'{LINE_SEPARATOR}\n\n'
@@ -344,6 +347,7 @@ def format_stats_message(total: int, displayed: int, otps: int, session_sms: int
         f'├ {ce("💌")} Total SMS        →  <b>{total}</b>\n'
         f'├ {ce("📊")} Displayed        →  <b>{displayed}</b>\n'
         f'├ {ce("🎁")} OTPs detected    →  <b>{otps}</b>\n'
+        f'├ {ce("📅")} OTPs this week   →  <b>{week_otps}</b>  <i>({week_label})</i>\n'
         f'╰ {ce("✨")} New this session →  <b>{session_sms}</b>\n\n'
         f'╭─ {ce("💎")} <b>SYSTEM</b>\n'
         f'├ {ce("🟢")} Status   →  <b>ACTIVE</b>\n'
@@ -559,7 +563,7 @@ async def _fetch_json(url: str) -> dict:
         ) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"Upstream {url} returned HTTP {resp.status}")
-            return await resp.json()
+            return await resp.json(content_type=None)
 
 
 async def fetch_sms() -> dict:
@@ -721,28 +725,49 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Stats counters (module-level, accessed by polling loop and command handlers)
 otp_count = 0
 total_sms_today = 0
+otp_timestamps: list[float] = []  # unix timestamps of every OTP detected this session
+
+
+def count_otps_since_monday() -> int:
+    """Return how many OTPs were detected from Monday 00:00 (local time) until now."""
+    now = datetime.now()
+    monday = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    cutoff = monday.timestamp()
+    return sum(1 for t in otp_timestamps if t >= cutoff)
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
         return
+
+    api_total = 0
+    api_displayed = 0
+    api_error = False
+
     try:
         data = await fetch_sms_cached()
-        text = format_stats_message(
-            data.get("total", 0),
-            len(data.get("records", [])),
-            otp_count,
-            total_sms_today,
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_stats")],
-        ])
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    except Exception:
-        await update.message.reply_text(
-            "❌ <b>Failed to fetch stats.</b> Try again.",
-            parse_mode=ParseMode.HTML,
-        )
+        api_total = data.get("total", 0)
+        api_displayed = len(data.get("records", []))
+    except Exception as err:
+        logger.error(f"cmd_stats API fetch failed: {err}")
+        api_error = True
+
+    text = format_stats_message(
+        api_total,
+        api_displayed,
+        otp_count,
+        total_sms_today,
+        count_otps_since_monday(),
+    )
+    if api_error:
+        text += f'\n\n{ce("⚠️")} <i>API offline — showing session data only</i>'
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_stats")],
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -967,22 +992,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         elif data == "refresh_stats":
             await query.answer("⚡️ Refreshing...", show_alert=False)
+            api_total = 0
+            api_displayed = 0
+            api_err = False
             try:
                 d = await fetch_sms_cached()
-                stats_text = format_stats_message(
-                    d.get("total", 0),
-                    len(d.get("records", [])),
-                    otp_count,
-                    total_sms_today,
-                )
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_stats")],
-                ])
+                api_total = d.get("total", 0)
+                api_displayed = len(d.get("records", []))
+            except Exception as err:
+                logger.error(f"refresh_stats API fetch failed: {err}")
+                api_err = True
+            stats_text = format_stats_message(
+                api_total,
+                api_displayed,
+                otp_count,
+                total_sms_today,
+                count_otps_since_monday(),
+            )
+            if api_err:
+                stats_text += f'\n\n{ce("⚠️")} <i>API offline — showing session data only</i>'
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_stats")],
+            ])
+            try:
                 await query.edit_message_text(
                     stats_text, parse_mode=ParseMode.HTML, reply_markup=kb,
                 )
-            except Exception:
-                pass
+            except Exception as err:
+                logger.error(f"refresh_stats edit failed: {err}")
 
     except Exception as err:
         logger.error(f"Callback query error: {err}")
@@ -998,7 +1035,7 @@ poll_in_progress = False
 
 
 async def poll_sms(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global latest_seen_timestamp, is_first_run, otp_count, total_sms_today, poll_in_progress
+    global latest_seen_timestamp, is_first_run, otp_count, total_sms_today, poll_in_progress, otp_timestamps
 
     if poll_in_progress:
         return
@@ -1045,6 +1082,7 @@ async def poll_sms(context: ContextTypes.DEFAULT_TYPE) -> None:
             for sms in new_messages:
                 if is_otp_message(sms["body"]):
                     otp_count += 1
+                    otp_timestamps.append(time.time())
                 total_sms_today += 1
                 logger.info(f"Dev mode: SMS tracked (not forwarded) — {sms['phone']}")
             return
@@ -1064,6 +1102,7 @@ async def poll_sms(context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 if has_otp and otp:
                     otp_count += 1
+                    otp_timestamps.append(time.time())
                     text = format_otp_message(sms)
                     rows = build_otp_rows(sms, store_id)
                     try:
