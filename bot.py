@@ -777,7 +777,7 @@ def register_stats_message(chat_id: int | str, message_id: int, ttl: int = 300) 
 def build_stats_rows() -> list[list[dict]]:
     """Build premium colored Refresh button rows for stats."""
     return [
-        [with_icon({"text": "🔄  Live Refresh", "callback_data": "refresh_stats", "style": "primary"}, "🔄")],
+        [with_icon({"text": "Live Refresh", "callback_data": "refresh_stats", "style": "primary"}, "🔄")],
     ]
 
 
