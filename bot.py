@@ -774,11 +774,11 @@ def register_stats_message(chat_id: int | str, message_id: int, ttl: int = 300) 
     }
 
 
-def build_stats_keyboard() -> InlineKeyboardMarkup:
-    """Stable stats keyboard — no unofficial fields, no flicker."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Live Refresh", callback_data="refresh_stats")],
-    ])
+def build_stats_rows() -> list[list[dict]]:
+    """Premium stats keyboard rows — same pattern as OTP/SMS buttons."""
+    return [
+        [with_icon({"text": "Live Refresh", "callback_data": "refresh_stats"}, "🔄")],
+    ]
 
 
 async def _refresh_active_stats(bot, data: dict) -> None:
@@ -790,7 +790,10 @@ async def _refresh_active_stats(bot, data: dict) -> None:
     api_total = data.get("total", 0)
     week_otps = count_otps_from_records(records)
     stats_text = format_stats_message(api_total, len(records), otp_count, total_sms_today, week_otps)
-    kb = build_stats_keyboard()
+
+    rows = build_stats_rows()
+    kb_full = _colorize(rows)
+    kb_plain = _strip_icons(kb_full)
 
     now = time.time()
     expired = [k for k, v in active_stats_messages.items() if now > v["expires"]]
@@ -799,20 +802,24 @@ async def _refresh_active_stats(bot, data: dict) -> None:
 
     for key, info in list(active_stats_messages.items()):
         try:
-            await bot.edit_message_text(
-                chat_id=info["chat_id"],
-                message_id=info["message_id"],
-                text=stats_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb,
-            )
+            payload = {
+                "chat_id": info["chat_id"],
+                "message_id": info["message_id"],
+                "text": stats_text,
+                "parse_mode": "HTML",
+            }
+            resp = await _tg_post(BOT_TOKEN, "editMessageText", {**payload, "reply_markup": kb_full})
+            if not resp.get("ok"):
+                desc = resp.get("description", "").lower()
+                if "not modified" in desc:
+                    continue
+                # fallback: strip icons only
+                resp = await _tg_post(BOT_TOKEN, "editMessageText", {**payload, "reply_markup": kb_plain})
+                if not resp.get("ok") and "not modified" not in resp.get("description", "").lower():
+                    active_stats_messages.pop(key, None)
         except Exception as err:
-            desc = str(err).lower()
-            if "not modified" in desc:
-                pass  # identical content, fine
-            else:
-                logger.warning(f"Auto-refresh stats {key}: {err}")
-                active_stats_messages.pop(key, None)
+            logger.warning(f"Auto-refresh stats {key}: {err}")
+            active_stats_messages.pop(key, None)
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -836,9 +843,18 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if api_error:
         text += f'\n\n{ce("⚠️")} <i>API offline — showing session data only</i>'
 
-    kb = build_stats_keyboard()
-    sent = await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    register_stats_message(update.effective_chat.id, sent.message_id)
+    rows = build_stats_rows()
+    try:
+        resp = await raw_send(BOT_TOKEN, update.effective_chat.id, text, rows)
+        msg_id = resp.get("result", {}).get("message_id")
+        if msg_id:
+            register_stats_message(update.effective_chat.id, msg_id)
+    except Exception:
+        kb_fb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Live Refresh", callback_data="refresh_stats")],
+        ])
+        sent = await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_fb)
+        register_stats_message(update.effective_chat.id, sent.message_id)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1081,15 +1097,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if api_err_r:
                 stats_text += f'\n\n{ce("⚠️")} <i>API offline — showing session data only</i>'
 
-            kb_r = build_stats_keyboard()
-            register_stats_message(query.message.chat.id, query.message.message_id)
-            try:
-                await query.edit_message_text(
-                    stats_text, parse_mode=ParseMode.HTML, reply_markup=kb_r,
-                )
-            except Exception as err:
-                if "not modified" not in str(err).lower():
-                    logger.error(f"refresh_stats edit failed: {err}")
+            rows_r = build_stats_rows()
+            kb_r_full = _colorize(rows_r)
+            kb_r_plain = _strip_icons(kb_r_full)
+
+            chat_id_r = query.message.chat.id
+            msg_id_r = query.message.message_id
+            register_stats_message(chat_id_r, msg_id_r)
+
+            payload_r = {
+                "chat_id": chat_id_r,
+                "message_id": msg_id_r,
+                "text": stats_text,
+                "parse_mode": "HTML",
+            }
+            resp_r = await _tg_post(BOT_TOKEN, "editMessageText", {**payload_r, "reply_markup": kb_r_full})
+            if not resp_r.get("ok"):
+                desc_r = resp_r.get("description", "").lower()
+                if "not modified" not in desc_r:
+                    resp_r = await _tg_post(BOT_TOKEN, "editMessageText", {**payload_r, "reply_markup": kb_r_plain})
+                    if not resp_r.get("ok") and "not modified" not in resp_r.get("description", "").lower():
+                        logger.error(f"refresh_stats edit failed: {resp_r.get('description')}")
 
     except Exception as err:
         logger.error(f"Callback query error: {err}")
